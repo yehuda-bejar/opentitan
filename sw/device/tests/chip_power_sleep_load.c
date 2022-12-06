@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #include "sw/device/lib/base/mmio.h"
+#include "sw/device/lib/dif/dif_adc_ctrl.h"
 #include "sw/device/lib/dif/dif_alert_handler.h"
 #include "sw/device/lib/dif/dif_gpio.h"
 #include "sw/device/lib/dif/dif_otp_ctrl.h"
@@ -16,7 +17,6 @@
 #include "sw/device/lib/dif/dif_rv_core_ibex.h"
 #include "sw/device/lib/dif/dif_rv_timer.h"
 #include "sw/device/lib/runtime/hart.h"
-#include "sw/device/lib/runtime/irq.h"
 #include "sw/device/lib/runtime/log.h"
 #include "sw/device/lib/testing/alert_handler_testutils.h"
 #include "sw/device/lib/testing/aon_timer_testutils.h"
@@ -41,7 +41,6 @@ static volatile bool irq_is_pending = false;
 
 static dif_aon_timer_t aon_timer;
 static dif_rv_core_ibex_t rv_core_ibex;
-static dif_rv_plic_t rv_plic;
 static dif_pwrmgr_t pwrmgr;
 static dif_rv_timer_t rv_timer;
 static dif_alert_handler_t alert_handler;
@@ -49,14 +48,13 @@ static dif_pwm_t pwm;
 static dif_pinmux_t pinmux;
 static dif_otp_ctrl_t otp_ctrl;
 static dif_gpio_t gpio;
+static dif_adc_ctrl_t adc_ctrl;
 
 static volatile const bool kCoreClkOff = false;
 static volatile const bool kIoClkOff = false;
 static volatile const bool kUsbSlpOff = false;
 static volatile const bool kUsbActOff = false;
 static volatile const bool kDeepSleep = false;
-
-static const uint32_t kPlicTarget = kTopEarlgreyPlicTargetIbex0;
 
 OTTF_DEFINE_TEST_CONFIG();
 
@@ -91,13 +89,6 @@ static void wdog_irq_handler(void) {
 
   CHECK_DIF_OK(
       dif_aon_timer_irq_acknowledge(&aon_timer, kDifAonTimerIrqWdogTimerBark));
-
-  // Signal a software interrupt
-  dif_rv_plic_t rv_plic_isr;
-  mmio_region_t plic_base_addr =
-      mmio_region_from_addr(TOP_EARLGREY_RV_PLIC_BASE_ADDR);
-  CHECK_DIF_OK(dif_rv_plic_init(plic_base_addr, &rv_plic_isr));
-  CHECK_DIF_OK(dif_rv_plic_software_irq_force(&rv_plic_isr, kPlicTarget));
 }
 
 // Functions
@@ -143,6 +134,8 @@ bool test_main(void) {
       mmio_region_from_addr(TOP_EARLGREY_OTP_CTRL_CORE_BASE_ADDR), &otp_ctrl));
   CHECK_DIF_OK(
       dif_gpio_init(mmio_region_from_addr(TOP_EARLGREY_GPIO_BASE_ADDR), &gpio));
+  CHECK_DIF_OK(dif_adc_ctrl_init(
+      mmio_region_from_addr(TOP_EARLGREY_ADC_CTRL_AON_BASE_ADDR), &adc_ctrl));
 
   LOG_INFO("Running CHIP Power Sleep Load test");
 
@@ -363,15 +356,35 @@ bool test_main(void) {
     // activate in Wakeup mode (no need for IRQ)
     aon_timer_testutils_wakeup_config(&aon_timer, kTimeTillBark);
   } else {
-    // Unmask the software interrupt so it can be used to bring the CPU out of
-    // sleep without having an NMI race WFI.
-    irq_software_ctrl(/*en=*/true);
-
     // activate in Watchdog mode & IRQ
     aon_timer_testutils_watchdog_config(&aon_timer, count_cycles, UINT32_MAX,
                                         false);
   }
   LOG_INFO("AON Timer active");
+
+  // ADC Controller
+  const uint8_t kNumLowPowerSamples = 2;
+  const uint8_t kNumNormalPowerSamples = 1;
+  const uint64_t kPowerUpTime = 15;
+  const uint64_t kWakeUpTime = 500;
+  uint32_t power_up_time_aon_cycles =
+      aon_timer_testutils_get_aon_cycles_from_us(kPowerUpTime);
+  uint32_t wake_up_time_aon_cycles =
+      aon_timer_testutils_get_aon_cycles_from_us(kWakeUpTime);
+
+  // ADC configuration
+  CHECK_DIF_OK(dif_adc_ctrl_set_enabled(&adc_ctrl, kDifToggleDisabled));
+  CHECK_DIF_OK(dif_adc_ctrl_reset(&adc_ctrl));
+  CHECK_DIF_OK(dif_adc_ctrl_configure(
+      &adc_ctrl, (dif_adc_ctrl_config_t){
+                     .mode = kDifAdcCtrlLowPowerScanMode,
+                     .num_low_power_samples = kNumLowPowerSamples,
+                     .num_normal_power_samples = kNumNormalPowerSamples,
+                     .power_up_time_aon_cycles = power_up_time_aon_cycles,
+                     .wake_up_time_aon_cycles = wake_up_time_aon_cycles}));
+  CHECK_DIF_OK(dif_adc_ctrl_set_enabled(&adc_ctrl, kDifToggleEnabled));
+
+  LOG_INFO("ADC Controller active");
 
   // Power Manager
   dif_pwrmgr_domain_config_t pwrmgr_cfg;
@@ -397,17 +410,7 @@ bool test_main(void) {
   test_status_set(0xff20);
   wait_for_interrupt();
 
-  // Check for software interrupt and clear. Re-initialize the struct in case
-  // the software interrupt did not happen.
-  mmio_region_t plic_base_addr =
-      mmio_region_from_addr(TOP_EARLGREY_RV_PLIC_BASE_ADDR);
-  CHECK_DIF_OK(dif_rv_plic_init(plic_base_addr, &rv_plic));
-  bool software_irq_pending;
-  CHECK_DIF_OK(dif_rv_plic_software_irq_is_pending(&rv_plic, kPlicTarget,
-                                                   &software_irq_pending));
-  CHECK(software_irq_pending,
-        "Software IRQ unexpectedly not pending after WFI");
-  CHECK_DIF_OK(dif_rv_plic_software_irq_acknowledge(&rv_plic, kPlicTarget));
+  // Check NMI
 
   // We expect the watchdog bark interrupt to be pending on the peripheral side.
   CHECK(irq_is_pending, "Expected watchdog bark interrupt to be pending");
